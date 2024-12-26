@@ -13,16 +13,22 @@ from sklearn.metrics import root_mean_squared_log_error
 
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
+from datetime import datetime
 
 # Setting this so jupyter shows every column
 pd.set_option('display.max_columns', None)
 
 random_state = 42
-opt_iter = 50
+opt_iter = 100
 
 target = "Premium Amount"
 train_df = pd.read_csv("train.csv")
+
+test_df = pd.read_csv("test.csv")
+
 train_df.drop(columns=["id"], inplace=True)
+
+test_df, idx = test_df.drop("id", axis=1), test_df["id"]
 
 print(train_df.info())
 print("=" * 50)
@@ -159,32 +165,53 @@ for col in train_df.columns:
 # plt.savefig("corr_map.jpg", dpi=300)
 # plt.show()
 
-train_df["Age Binnded"] = pd.cut(train_df["Age"], bins=10)
 
-# 'Annual Income' is positively skewed thus
-# I'm applying square root transformation
-train_df["Annual Income"] = np.sqrt(train_df["Annual Income"])
+def feature_engineering(df) -> pd.DataFrame:
 
-upper_bound = train_df["Annual Income"].mean() + 2 * train_df["Annual Income"].std()
-train_df = train_df[
-    (train_df["Annual Income"] <= upper_bound)
-]
+    df["Age Binnded"] = pd.cut(df["Age"], bins=10)
 
-upper_bound = train_df["Previous Claims"].mean() + 2 * train_df["Previous Claims"].std()
-train_df = train_df[
-    (train_df["Previous Claims"] <= upper_bound)
-]
+    # 'Annual Income' is positively skewed thus
+    # I'm applying square root transformation
+    df["Annual Income"] = np.sqrt(df["Annual Income"])
 
-oe = OrdinalEncoder(categories=[
-    ["High School", "Bachelor's", "Master's", "PhD"]
-])
+    oe = OrdinalEncoder(categories=[
+        ["High School", "Bachelor's", "Master's", "PhD"]
+    ])
 
-# Using ordinal encoding on the 'Education Level' data
-train_df["Education Level"] = oe.fit_transform(train_df[["Education Level"]])
+    # Using ordinal encoding on the 'Education Level' data
+    df["Education Level"] = oe.fit_transform(df[["Education Level"]])
 
-train_df["Income/Credit"] = train_df["Annual Income"] / train_df["Credit Score"]
-train_df["VAge/Duration"] = train_df["Vehicle Age"] / train_df["Insurance Duration"]
-train_df["Education-Income"] = train_df["Education Level"] * train_df["Annual Income"]
+    # df["Income/Credit"] = df["Annual Income"] / df["Credit Score"]
+    # df["VAge/Duration"] = df["Vehicle Age"] / df["Insurance Duration"]
+    # df["Education-Income"] = df["Education Level"] * df["Annual Income"]
+
+    df["Policy Start Date"] = pd.to_datetime(
+        df["Policy Start Date"],
+        format="ISO8601"
+    )
+
+    upper_bound = df["Annual Income"].mean() + 2 * df["Annual Income"].std()
+    df["Annual Income"] = df["Annual Income"].clip(upper=upper_bound)
+
+    upper_bound = df["Previous Claims"].mean() + 2 * df["Previous Claims"].std()
+    df["Previous Claims"] = df["Previous Claims"].clip(upper=upper_bound)
+
+    df["year"] = df["Policy Start Date"].dt.year
+    df["month"] = df["Policy Start Date"].dt.month
+    df["day"] = df["Policy Start Date"].dt.day
+    df["day_of_the_week"] = df["Policy Start Date"].dt.dayofweek
+
+    df.drop("Policy Start Date", axis=1, inplace=True)
+
+    return df
+
+
+train_df = feature_engineering(train_df)
+test_df = feature_engineering(test_df)
+
+train, eval = train_test_split(train_df,
+                               train_size=0.8,
+                               random_state=random_state)
 
 num_pipeline = Pipeline(
     steps=[
@@ -207,25 +234,13 @@ preprocessor = ColumnTransformer(
     ]
 )
 
-train_df["Policy Start Date"] = pd.to_datetime(
-    train_df["Policy Start Date"],
-    format="ISO8601"
-)
-
-train_df["year"] = train_df["Policy Start Date"].dt.year
-train_df["month"] = train_df["Policy Start Date"].dt.month
-train_df["day"] = train_df["Policy Start Date"].dt.day
-train_df["day_of_the_week"] = train_df["Policy Start Date"].dt.dayofweek
-
-train, eval = train_test_split(train_df,
-                               train_size=0.8,
-                               random_state=random_state)
-
 X_train, y_train = train.drop(target, axis=1), train[target]
 X_eval, y_eval = eval.drop(target, axis=1), eval[target]
 
 X_train = preprocessor.fit_transform(X_train)
 X_eval = preprocessor.transform(X_eval)
+
+test = preprocessor.transform(test_df)
 
 y_train = np.sqrt(y_train)
 
@@ -273,11 +288,6 @@ model_XGB = XGBRegressor(**study_XGB.best_params, random_state=random_state)
 
 model_XGB.fit(X_train, y_train)
 
-# importances = model_XGB.feature_importances_
-# sns.barplot(x=importances, y=preprocessor.get_feature_names_out())
-# plt.title("Feature Importance - XGBoost")
-# plt.show()
-
 
 def objective_LGB(trial) -> float:
     params = {
@@ -315,4 +325,29 @@ study_LGB = optuna.create_study(direction='minimize')
 study_LGB.optimize(objective_LGB, n_trials=opt_iter)
 
 model_LGB = LGBMRegressor(**study_LGB.best_params, random_state=random_state)
+
+model_LGB.fit(X_train, y_train)
+
+pred_XGB = model_XGB.predict(test)**2
+pred_LGB = model_LGB.predict(test)**2
+
+submission_XGB = pd.DataFrame({
+    "id": idx,
+    target: pred_XGB
+})
+
+submission_LGB = pd.DataFrame({
+    "id": idx,
+    target: pred_LGB
+})
+
+submission_XGB.to_csv(
+    f"submission_{datetime.now().strftime("%Y%m%d_%H%M%S")}_XGB.csv",
+    index=False
+)
+
+submission_LGB.to_csv(
+    f"submission_{datetime.now().strftime("%Y%m%d_%H%M%S")}_LGB.csv",
+    index=False
+)
 
